@@ -432,41 +432,56 @@ async function planArtifactTopics({ sys, baseUserText, transcript, bot, callChat
  * the output fits and is not truncated.
  */
 /**
- * 用视觉模型一次性描述所有附图（分篇路径用）。返回的 altTexts 供索引页做
+ * 用视觉模型描述所有附图（分篇路径用）。返回的 altTexts 供索引页做
  * alt 文本，block 是可直接注入分篇生成提示词的图片描述文本。
- * 视觉未配置 / 调用失败时静默降级：altTexts={}、block=""，不阻断分篇。
+ * 图片太多时**分批**调用（一次发给视觉模型太多图会挂死/超时，实测 3–6 张
+ * 正常、12 张无响应），每批用全局连续编号，模型不按格式输出时按行兜底。
+ * 视觉未配置 / 全部调用失败时静默降级：altTexts={}、block=""，不阻断分篇。
  */
 async function describeDownloadedImages(downloaded, { visionModel, resolvedVisionBase, visionKey }) {
+	const BATCH = 5;
+	const BATCH_TIMEOUT = 120000; // 每批硬超时：方舟等视觉 API 偶发极慢/挂起，不能拖垮整个分篇
 	if (!visionModel || !Array.isArray(downloaded) || downloaded.length === 0) return { altTexts: {}, block: "" };
-	try {
-		const visionUser = [
-			{ type: "text", text: `以下有 ${downloaded.length} 张图片（一段 AI 对话中的附图）。请依次为每张图写一句中文内容说明（画面主体、风格、关键元素），严格按以下格式输出：\n` + downloaded.map((_, i) => `- 图${i + 1}：<一句话说明>`).join("\n") },
-			...downloaded.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))
-		];
-		const desc = await forwardChatCompletion({
-			base: resolvedVisionBase,
-			apiKey: visionKey,
-			model: visionModel,
-			messages: [
-				{ role: "system", content: "你是图片描述助手。只按指定格式输出每张图的描述清单，不要多余内容。" },
-				{ role: "user", content: visionUser }
-			]
-		});
-		const altTexts = {};
-		const parsed = parseImageAltList(desc);
-		// 模型偶尔不严格按「图N：」格式输出：退化为按行拆分描述。
-		if (Object.keys(parsed).length === 0) {
-			String(desc).split(/\n+/)
-				.map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
-				.filter(Boolean)
-				.forEach((line, idx) => { if (!parsed[idx + 1]) parsed[idx + 1] = line.slice(0, 200); });
+	const altTexts = {};
+	let anyOk = false;
+	for (let start = 0; start < downloaded.length; start += BATCH) {
+		const chunk = downloaded.slice(start, start + BATCH);
+		const from = start + 1;
+		const to = start + chunk.length;
+		try {
+			const visionUser = [
+				{ type: "text", text: `以下有 ${chunk.length} 张图片（一组 AI 对话附图的第 ${from}~${to} 张）。请依次为每张图写一句中文内容说明（画面主体、风格、关键元素）。编号必须从 ${from} 到 ${to}，严格按以下格式输出：\n` + chunk.map((_, i) => `- 图${from + i}：<一句话说明>`).join("\n") },
+				...chunk.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))
+			];
+			const desc = await Promise.race([
+				forwardChatCompletion({
+					base: resolvedVisionBase,
+					apiKey: visionKey,
+					model: visionModel,
+					messages: [
+						{ role: "system", content: "你是图片描述助手。只按指定格式输出每张图的描述清单，不要多余内容。" },
+						{ role: "user", content: visionUser }
+					]
+				}),
+				new Promise((_, rej) => setTimeout(() => rej(new Error("视觉批处理超时")), BATCH_TIMEOUT))
+			]);
+			const parsed = parseImageAltList(desc);
+			// 模型偶尔不严格按「图N：」格式输出：退化为按行拆分描述（按该批起始编号）。
+			if (Object.keys(parsed).length === 0) {
+				String(desc).split(/\n+/)
+					.map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
+					.filter(Boolean)
+					.forEach((line, idx) => { const num = from + idx; if (!parsed[num]) parsed[num] = line.slice(0, 200); });
+			}
+			for (const [k, v] of Object.entries(parsed)) altTexts[Number(k)] = v;
+			anyOk = true;
+		} catch {
+			/* 该批失败不阻断，继续下一批 */
 		}
-		for (const [k, v] of Object.entries(parsed)) altTexts[Number(k)] = v;
-		const descLines = downloaded.map((_, i) => `- 图${i + 1}：${altTexts[i + 1] || "（未识别）"}`);
-		return { altTexts, block: "对话附图描述（由视觉模型识别）：\n" + descLines.join("\n") };
-	} catch {
-		return { altTexts: {}, block: "" };
 	}
+	if (!anyOk) return { altTexts: {}, block: "" };
+	const descLines = downloaded.map((_, i) => `- 图${i + 1}：${altTexts[i + 1] || "（未识别）"}`);
+	return { altTexts, block: "对话附图描述（由视觉模型识别）：\n" + descLines.join("\n") };
 }
 
 async function generateOneArtifact({ sys, baseUserText, transcript, bot, title, source, topic, index, total, allTopics, callChat, imageBlock }) {
@@ -769,8 +784,8 @@ async function serverDistill(payload) {
 	// Summarize: vision model when images exist and are configured, else text model.
 	// 文本路径用「无限续写」(completeLongOutput) 防截断（D）；空输出时回退
 	// forwardChatCompletion（处理 reasoning_content 等边缘情况）。
-	const summarizeMessages = (sysText) => {
-		if (downloaded.length > 0 && visionModel) {
+	const summarizeMessages = (sysText, forceText = false) => {
+		if (!forceText && downloaded.length > 0 && visionModel) {
 			const content = [
 				{
 					type: "text",
@@ -784,14 +799,25 @@ async function serverDistill(payload) {
 			return { mode: "vision", messages: [{ role: "system", content: sysText }, { role: "user", content }] };
 		}
 		const note = downloaded.length > 0
-			? baseUserText + `\n\n（注：该对话还包含 ${downloaded.length} 张图片，但未配置视觉模型，图片内容未纳入总结。）`
+			? baseUserText + `\n\n（注：该对话还包含 ${downloaded.length} 张图片，但视觉识别失败或未配置视觉模型，图片内容未纳入总结；图片仍会随笔记保存。）`
 			: baseUserText;
 		return { mode: "text", messages: [{ role: "system", content: sysText }, { role: "user", content: note }] };
 	};
 	const runSummarize = async (sysText) => {
 		const req = summarizeMessages(sysText);
 		if (req.mode === "vision") {
-			return { body: await forwardChatCompletion({ base: resolvedVisionBase, apiKey: visionKey, model: visionModel, messages: req.messages }), vision: true };
+			try {
+				return { body: await forwardChatCompletion({ base: resolvedVisionBase, apiKey: visionKey, model: visionModel, messages: req.messages }), vision: true };
+			} catch {
+				// 图太多/太大导致视觉调用失败 → 降级为纯文本总结（图片仍保存为附件），避免整体失败
+				const textReq = summarizeMessages(sysText, true);
+				const long = await completeLongOutput({ base: providerInfo.base, apiKey, model, messages: textReq.messages, max_tokens: 8192, maxRounds: 4 });
+				let body = long && long.content ? long.content : "";
+				if (!body.trim()) {
+					body = await forwardChatCompletion({ base: providerInfo.base, apiKey, model, messages: textReq.messages });
+				}
+				return { body, vision: false };
+			}
 		}
 		const long = await completeLongOutput({ base: providerInfo.base, apiKey, model, messages: req.messages, max_tokens: 8192, maxRounds: 4 });
 		let body = long && long.content ? long.content : "";
@@ -1962,10 +1988,26 @@ async function fetchChatGptShare(url) {
 
 	// 决定哪些图是“被采纳/最终”的：对话里常见一边生成一边叫 AI 重画/调细节，
 	// 用户否掉或要求重画的中间版本不算有效结果，不该抓进第二大脑。
-	// pickAcceptedImageHexes 依据消息顺序 + 后续用户消息是否含“否定/重画”来判定。
-	const acceptedHexes = pickAcceptedImageHexes(imageMsgs);
-	const acceptedCount = acceptedHexes.size;
-	const rejectedCount = imageTotal - acceptedCount;
+	// 主路径：judgeAcceptedImages 让主模型按「每张图之后的用户反馈」判断（可靠、
+	// 可解释，状态栏会展示采纳/排除清单）；模型不可用时回退正则 pickAcceptedImageHexes。
+	let acceptedHexes = null;
+	let imageSummary = "";
+	let acceptedNone = false;
+	if (imageTotal > 0) {
+		const judgeCfg = await readSharedConfig();
+		const judged = await judgeAcceptedImages(imageMsgs, { title, cfg: judgeCfg });
+		if (judged) {
+			acceptedHexes = judged.acceptedHexes;
+			imageSummary = judged.summary;
+		} else {
+			acceptedHexes = pickAcceptedImageHexes(imageMsgs);
+			const rej = Math.max(0, imageTotal - acceptedHexes.size);
+			imageSummary = rej > 0 ? `已按反馈规则排除 ${rej} 张被否/草稿图` : "";
+		}
+		acceptedNone = imageTotal > 0 && acceptedHexes.size === 0;
+	}
+	const acceptedCount = acceptedHexes ? acceptedHexes.size : 0;
+	const rejectedCount = Math.max(0, imageTotal - acceptedCount);
 
 	// 用无头浏览器打开分享页抓图片真实字节（oaiusercontent CDN 带签名 URL，
 	// 服务端直连拿不到）。仅抓被采纳的图（acceptedHexes 为空表示全要）。
@@ -1986,6 +2028,8 @@ async function fetchChatGptShare(url) {
 		imageSaved: images.length,
 		imageSkipped: Math.max(0, acceptedCount - images.length),
 		imageRejected: rejectedCount,
+		imageSummary,
+		acceptedNone,
 		images,
 		messages
 	};
@@ -2003,7 +2047,8 @@ async function fetchChatGptShare(url) {
 function pickAcceptedImageHexes(imageMsgs) {
 	// 只匹配「明确否定/明确重做」语义，避免把“换背景/换口味/延伸/更可爱”这类
 	// 正向迭代请求误判成否定。单字“换/改/调/再/多/少”一律不作为否定依据。
-	const rejectRe = /重画|重做|重给|重新调|重新生成|重新按指令|重来|不行|不对|不好|不满意|难看|有问题|画错了|画错|三个手|三只手/;
+	// 注意：这只是 LLM 判断失败时的兜底；主路径见 judgeAcceptedImages。
+	const rejectRe = /重画|重做|重给|重新调|重新生成|重新按指令|重来|再来一(版|张|次)|不行|还是不行|不太行|不对|不太对|感觉不对|不好|不太好|不好看|难看|不满意|不喜欢|有问题|画错了|画错|三个手|三只手|去掉|删掉|换掉|不要这个|不要这(种|版)|不要背景|这版(不行|不好|废了)|again|try again|not (this|that|one)|remove|drop (it|this)|looks? wrong|no good|ugly/i;
 	const accepted = new Set();
 	const thread = []; // 连续 AI 生成图划分一轮
 	const order = [];
@@ -2042,6 +2087,98 @@ function pickAcceptedImageHexes(imageMsgs) {
 		}
 	}
 	return accepted;
+}
+
+/** 主模型厂商 Base URL（图片取舍判断用；与 serverDistill 的厂商表保持一致）。 */
+const SB2B_JUDGE_BASES = {
+	ark: "https://ark.cn-beijing.volces.com/api/v3",
+	deepseek: "https://api.deepseek.com",
+	moonshot: "https://api.moonshot.cn/v1",
+	dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+	zhipu: "https://open.bigmodel.cn/api/paas/v4"
+};
+
+/**
+ * 用主模型判断哪些 AI 生成图是「用户最终采纳」的：给每张图附上其所在消息
+ * 文本与**其后第一条用户反馈**，让模型按用户的认可/否定来取舍（比正则可靠，
+ * 也解释了「抓取标准」——标准就是用户自己的反馈）。
+ * @returns { acceptedHexes:Set<string>, summary:string }；无法判断
+ *   （未配置模型 / 调用失败 / 输出无法解析）时返回 null，调用方回退到
+ *   pickAcceptedImageHexes 正则兜底。
+ * @param callChat - 可选注入，便于测试；默认用主模型 forwardChatCompletion。
+ */
+async function judgeAcceptedImages(imageMsgs, { title, cfg, callChat }) {
+	const provider = String((cfg && cfg.provider) || "ark");
+	const apiKey = String((cfg && cfg.apiKey) || "").trim();
+	const model = String((cfg && cfg.model) || "").trim();
+	const base = provider === "custom"
+		? String((cfg && cfg.baseCustom) || "").trim()
+		: (SB2B_JUDGE_BASES[provider] || SB2B_JUDGE_BASES.ark);
+	if (!apiKey || !model || !base) return null;
+	const chat = callChat || ((msgs) => forwardChatCompletion({ base, apiKey, model, messages: msgs }));
+
+	// 按出现顺序编号：每个 hex 是一张图，附带其所在消息文本与之后第一条用户反馈。
+	// 用户自己上传的参考图（role=user 带图）不算 AI 生成结果，不参与取舍。
+	const items = [];
+	for (let i = 0; i < imageMsgs.length; i++) {
+		const m = imageMsgs[i];
+		if (!Array.isArray(m.hexes) || !m.hexes.length) continue;
+		if (m.role === "user") continue;
+		let nextUser = "";
+		for (let j = i + 1; j < imageMsgs.length; j++) {
+			if (imageMsgs[j].role === "user") { nextUser = String(imageMsgs[j].text || "").trim(); break; }
+		}
+		const ctxParts = [];
+		if (m.text) ctxParts.push(`所在消息：${String(m.text).slice(0, 100)}`);
+		ctxParts.push(nextUser ? `其后用户反馈：${nextUser.slice(0, 200)}` : "其后无用户反馈");
+		const ctx = ctxParts.join("；");
+		for (const hex of m.hexes) items.push({ hex, ctx });
+	}
+	if (items.length === 0) return null;
+
+	const prompt = [
+		`对话标题：${title || ""}`,
+		`以下是这段对话中出现的 ${items.length} 张 AI 生成图片（按出现顺序编号）。每张给出它的上下文（所在消息 + 其后第一条用户反馈）：`,
+		"",
+		items.map((it, idx) => `图${idx + 1}：${it.ctx}`).join("\n"),
+		"",
+		"判断规则：",
+		"- 用户在其后反馈中明确认可（不错/很好/就要这个/喜欢/可以了/继续用等），或其后无反馈 → 采纳",
+		"- 用户明确否定、要求重画/修改（不要/不行/重画/换掉/去掉/不好看/再改等），或之后又生成了新版本 → 旧图视为草稿，不采纳",
+		"- 只依据给出的反馈文本判断，不要臆测",
+		"",
+		"只输出两行：",
+		"采纳：<编号列表，逗号分隔；无则写 无>",
+		"不采纳：<编号列表，逗号分隔；无则写 无>"
+	].join("\n");
+	let out;
+	try {
+		out = String(await chat([
+			{ role: "system", content: "你是图片取舍助手。只按指定格式输出采纳/不采纳的编号列表，不要多余内容。" },
+			{ role: "user", content: prompt }
+		]) || "").trim();
+	} catch {
+		return null;
+	}
+	const parseList = (label) => {
+		// 「不采纳」里含子串「采纳」，用负向断言避免误匹配。
+		const re = label === "采纳" ? /(?<!不)采纳\s*[：:]\s*([^\n]*)/ : /不采纳\s*[：:]\s*([^\n]*)/;
+		const m = re.exec(out);
+		if (!m) return null;
+		const text = m[1].trim();
+		if (/^无$/.test(text)) return [];
+		return text.split(/[,，、\s]+/).map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 1 && n <= items.length);
+	};
+	const acc = parseList("采纳");
+	const rej = parseList("不采纳");
+	if (acc === null && rej === null) return null;
+	// 采纳列表缺失时，未出现在“不采纳”里的都视为采纳。
+	const acceptedNums = acc !== null ? new Set(acc) : new Set(items.map((_, i) => i + 1).filter((n) => !rej.includes(n)));
+	const acceptedHexes = new Set(items.filter((_, i) => acceptedNums.has(i + 1)).map((it) => it.hex));
+	const accList = items.map((_, i) => i + 1).filter((n) => acceptedNums.has(n));
+	const rejList = items.map((_, i) => i + 1).filter((n) => !acceptedNums.has(n));
+	const summary = `已按用户反馈采纳 ${accList.length} 张（按对话顺序：图${accList.map((n) => n).join(",") || "无"}），排除 ${rejList.length} 张草稿/被否版本（按对话顺序：图${rejList.map((n) => n).join(",") || "无"}）`;
+	return { acceptedHexes, summary };
 }
 
 /** 探测并加载本机可用的 puppeteer-core（不同安装目录随机替换，需动态解析）。 */
@@ -2104,9 +2241,13 @@ async function captureChatGptImages(shareUrl, maxCount = 12, acceptedHexes = nul
 	const allowed = acceptedHexes && acceptedHexes.size ? acceptedHexes : null; // null=不限
 	const seenFiles = new Set();
 	const uniqUrls = new Map();
-	// 每个 URL(i.currentSrc/src) 的主文件 id（files/<uuid>）用于和 sediment hex 对账去重
+	// 每个 URL(i.currentSrc/src) 的主文件 id 用于和 sediment hex 对账去重。
+	// 兼容三种形态：/files/<uuid>/(raw|…)、/file-<uuid>?、blob 存储路径。
 	const fileHexOf = (u) => {
-		const m = typeof u === "string" && u.match(/[\/]files\/([0-9a-f-]+)\//i);
+		if (typeof u !== "string") return null;
+		const m = u.match(/[\/]files\/([0-9a-f-]{24,})/i)
+			|| u.match(/[\/]file-([0-9a-f-]{24,})/i)
+			|| u.match(/[\/](?:dalle|img|images)\/([0-9a-f-]{20,})/i);
 		if (!m) return null;
 		const hex = m[1].replace(/-/g, "");
 		return hex.length >= 24 ? hex : null;
@@ -2130,11 +2271,12 @@ async function captureChatGptImages(shareUrl, maxCount = 12, acceptedHexes = nul
 		await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
 
 		// 只收集页面最终渲染出来的 <img>（已采纳/展示中的图），再按 allowlist 过滤、去重。
+		// 不再硬编码 oaiusercontent 域名：收集所有 http(s) 图片，交给 fileHexOf + allowlist 判定。
 		// 不用 response 拦截，避免把加载后又隐藏的被否 draft 也算进来。
 		const domUrls = await page.evaluate(() =>
 			[...document.querySelectorAll("img")]
 				.map((i) => i.currentSrc || i.src)
-				.filter((s) => s && s.includes("oaiusercontent")) || []);
+				.filter((s) => s && /^https?:/i.test(s)) || []);
 		for (const u of domUrls) {
 			const hex = fileHexOf(u);
 			if (!hex) continue;
@@ -2151,7 +2293,29 @@ async function captureChatGptImages(shareUrl, maxCount = 12, acceptedHexes = nul
 				const dataUrl = await page.evaluate(async (url) => {
 					const r = await fetch(url);
 					if (!r.ok) throw new Error(r.status);
-					const b = await r.arrayBuffer();
+					const blob = await r.blob();
+					// 画布重编码压缩（最长边 1280、JPEG 0.85、白底合成防透明黑化）：
+					// 1.7MB PNG → ~200-400KB JPEG，视觉调用与附件体积都大幅下降。
+					// 压缩失败（非浏览器/跨域/解码异常）则退回原始 base64。
+					try {
+						if (typeof createImageBitmap === "function") {
+							const bmp = await createImageBitmap(blob);
+							const scale = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+							const w = Math.max(1, Math.round(bmp.width * scale));
+							const h = Math.max(1, Math.round(bmp.height * scale));
+							const canvas = document.createElement("canvas");
+							canvas.width = w;
+							canvas.height = h;
+							const ctx = canvas.getContext("2d");
+							ctx.fillStyle = "#ffffff";
+							ctx.fillRect(0, 0, w, h);
+							ctx.drawImage(bmp, 0, 0, w, h);
+							const jpeg = canvas.toDataURL("image/jpeg", 0.85);
+							bmp.close();
+							if (jpeg && jpeg.length > 0) return jpeg;
+						}
+					} catch { /* fall through to raw */ }
+					const b = await blob.arrayBuffer();
 					let bin = "";
 					const arr = new Uint8Array(b);
 					for (let j = 0; j < arr.length; j++) bin += String.fromCharCode(arr[j]);

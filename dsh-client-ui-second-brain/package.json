@@ -31,7 +31,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/<你的账号>/second-brain.git"
+    "url": "https://github.com/aduo-111/second-brain.git"
   },
   "engines": {
     "node": ">=18"
@@ -45,7 +45,7 @@
     }
   },
   "peerDependencies": {
-    "react": "^18.2.0",
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "react": "^18.2.0"
   }
 }
