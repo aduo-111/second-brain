@@ -2117,35 +2117,53 @@ async function judgeAcceptedImages(imageMsgs, { title, cfg, callChat }) {
 	if (!apiKey || !model || !base) return null;
 	const chat = callChat || ((msgs) => forwardChatCompletion({ base, apiKey, model, messages: msgs }));
 
-	// 按出现顺序编号：每个 hex 是一张图，附带其所在消息文本与之后第一条用户反馈。
+	// 按出现顺序编号：每个 hex 是一张图。给每张图配「用户此前要求/反馈 + 图所在消息
+	// + 生成后助手说明 + 用户随后反馈」的小语境，让模型做语义判断。
 	// 用户自己上传的参考图（role=user 带图）不算 AI 生成结果，不参与取舍。
 	const items = [];
 	for (let i = 0; i < imageMsgs.length; i++) {
 		const m = imageMsgs[i];
 		if (!Array.isArray(m.hexes) || !m.hexes.length) continue;
 		if (m.role === "user") continue;
+		let prevUser = "";
+		for (let j = i - 1; j >= 0; j--) {
+			if (imageMsgs[j].role === "user" && String(imageMsgs[j].text || "").trim()) { prevUser = String(imageMsgs[j].text).trim(); break; }
+		}
 		let nextUser = "";
+		let nextAssist = "";
 		for (let j = i + 1; j < imageMsgs.length; j++) {
-			if (imageMsgs[j].role === "user") { nextUser = String(imageMsgs[j].text || "").trim(); break; }
+			if (imageMsgs[j].role === "user" && !nextUser) nextUser = String(imageMsgs[j].text || "").trim();
+			else if (imageMsgs[j].role === "assistant" && !nextAssist && String(imageMsgs[j].text || "").trim()) nextAssist = String(imageMsgs[j].text).trim();
+			if (nextUser && nextAssist) break;
 		}
 		const ctxParts = [];
-		if (m.text) ctxParts.push(`所在消息：${String(m.text).slice(0, 100)}`);
-		ctxParts.push(nextUser ? `其后用户反馈：${nextUser.slice(0, 200)}` : "其后无用户反馈");
-		const ctx = ctxParts.join("；");
+		if (prevUser) ctxParts.push(`用户此前要求/反馈：${prevUser.slice(0, 120)}`);
+		if (m.text) ctxParts.push(`图所在消息：${String(m.text).slice(0, 120)}`);
+		if (nextAssist) ctxParts.push(`生成后助手说明：${nextAssist.slice(0, 120)}`);
+		ctxParts.push(nextUser ? `用户随后反馈：${nextUser.slice(0, 200)}` : "用户随后无反馈");
+		const ctx = ctxParts.join("\n  · ");
 		for (const hex of m.hexes) items.push({ hex, ctx });
 	}
 	if (items.length === 0) return null;
 
 	const prompt = [
 		`对话标题：${title || ""}`,
-		`以下是这段对话中出现的 ${items.length} 张 AI 生成图片（按出现顺序编号）。每张给出它的上下文（所在消息 + 其后第一条用户反馈）：`,
+		`以下是这段对话中出现的 ${items.length} 张 AI 生成图（按出现顺序编号）。每张附上它周围的对话片段（用户此前的要求/反馈、生成后助手的说明、用户随后的反馈）。请**理解对话语义**，判断每张图是否属于「用户最终认可、应保留的版本」：`,
 		"",
-		items.map((it, idx) => `图${idx + 1}：${it.ctx}`).join("\n"),
+		items.map((it, idx) => `图${idx + 1}：\n  · ${it.ctx}`).join("\n"),
 		"",
-		"判断规则：",
-		"- 用户在其后反馈中明确认可（不错/很好/就要这个/喜欢/可以了/继续用等），或其后无反馈 → 采纳",
-		"- 用户明确否定、要求重画/修改（不要/不行/重画/换掉/去掉/不好看/再改等），或之后又生成了新版本 → 旧图视为草稿，不采纳",
-		"- 只依据给出的反馈文本判断，不要臆测",
+		"判断要点（用语义理解，不要只匹配关键词；核心问题：这张图是『被认可的产出/基础』，还是『待修正的草稿』？）：",
+		"- **待修正的草稿 → 不采纳**：用户随后要求修改/重做当前图，包括换背景、改颜色、重新生成、「只要产品本身…」「去掉XX」「包装更可爱一点」「需要和上面的设计保持风格一致」（说明当前图不符合要求）等",
+		"- **被认可/作为基础 → 采纳**：用户明确认可且没有继续要求改动（「这个好，就这样」「就用这个」）；或用户基于当前图**延伸/扩展**（「根据这个延伸其他口味」「在此基础上做变体」）——当前图是基础版本，保留；或用户随后没有反馈（很可能是最终版本）",
+		"- **明确否定 → 不采纳**：不要 / 不行 / 换掉 / 去掉 / 不满意 / 丑…",
+		"- 注意：即使用户先说了「不错/喜欢」，只要随后又要求改动这张图，仍按草稿处理",
+		"- 只依据给出的对话片段判断，不要臆测",
+		"",
+		"三个示例帮助理解：",
+		"· 「只要产品本身的图，旁边可以加对应水果图，但不要有其他宣传文字，包装要更可爱一点」→ 修改当前图 → 不采纳",
+		"· 「可以，再根据这个延伸其他口味的设计，如苹果味、葡萄味、西瓜味、桃子味，图片分别出，放在一起」→ 基于当前图延伸 → 采纳",
+		"· 「需要和上面的设计保持风格一致」→ 当前图风格不一致、要求修正 → 不采纳",
+		"· 「再做一个草莓味的」→ 基于当前图延伸新口味 → 采纳（当前图是基础版本）",
 		"",
 		"只输出两行：",
 		"采纳：<编号列表，逗号分隔；无则写 无>",
