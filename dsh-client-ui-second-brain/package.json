@@ -15,7 +15,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml"
   ],
   "keywords": [
     "dsh",
