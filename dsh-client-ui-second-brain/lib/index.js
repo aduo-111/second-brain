@@ -25,6 +25,9 @@ import { existsSync } from "node:fs";
 import { access, mkdir, readFile, readdir, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+// 图片去留的确定性执行层（纯逻辑，见 lib/judge.js）
+import { applyKeepDropRules, computeReplacementMap } from "./judge.js";
 
 const execFileAsync = promisify(execFile);
 const ZSTD_CANDIDATES = ["zstd", "/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"];
@@ -458,6 +461,7 @@ async function describeDownloadedImages(downloaded, { visionModel, resolvedVisio
 					base: resolvedVisionBase,
 					apiKey: visionKey,
 					model: visionModel,
+					temperature: 0,
 					messages: [
 						{ role: "system", content: "你是图片描述助手。只按指定格式输出每张图的描述清单，不要多余内容。" },
 						{ role: "user", content: visionUser }
@@ -1986,9 +1990,13 @@ async function fetchChatGptShare(url) {
 	filteredImageMsgs.forEach((m) => imageMsgs.push(m));
 	if (messages.length === 0) throw new Error("分享数据里没有可提取的文字内容");
 
-	// 图片取舍：先抓取全部图片（临时，用于 AI 看图判断），再由模型按用户拍板的
-	// 四条规则（认可/扩展→保留；否定+替代→排除旧图；连续修改只留最终+认可基础版；
-	// 无法确定→默认保留）判断；**只返回判断保留的图**，废图不落盘。
+	// 图片取舍（AI 语义分类 + 程序确定性执行）：
+	// ① 抓取全部图片（临时，用于看图描述）
+	// ② 豆包视觉模型逐张写内容描述
+	// ③ 主模型（DeepSeek）对「每条用户反馈」做语义分类（approve/extend/modify/negate/uncertain）
+	//    + 分配修改链 lineageId；只输出 图片标识+证据+置信度，不输出去留
+	// ④ lib/judge.js 按四条规则确定性计算每张图 keep/drop
+	// **只返回保留的图**（废图不落盘）。分类结果按对话哈希缓存，重复导入不漂移。
 	let images = [];
 	let imageSummary = "";
 	let acceptedNone = false;
@@ -2001,7 +2009,6 @@ async function fetchChatGptShare(url) {
 		}
 		if (captured.length > 0) {
 			const cfg = await readSharedConfig();
-			// 视觉判断：看图 + 语义（需 vision 配置；无则用纯文本主模型判断）
 			const visionModel = String(cfg.visionModel || "").trim();
 			const visionKey = String(cfg.visionKey || "").trim() || String(cfg.apiKey || "").trim();
 			const visionProviders = {
@@ -2014,14 +2021,45 @@ async function fetchChatGptShare(url) {
 			};
 			const visionBase = String(cfg.visionBase || "").trim();
 			const resolvedVisionBase = visionBase || visionProviders[String(cfg.visionProvider || "").trim()] || "";
-			const judged = await judgeAcceptedImages(imageMsgs, captured, { title, cfg, visionModel, resolvedVisionBase, visionKey });
-			if (judged) {
-				imageSummary = judged.summary;
-				images = captured.filter((c) => judged.acceptedHexes.has(c.hex)).map((c) => c.dataUrl);
+			// ② 看图描述（失败则无描述，分类靠上下文）
+			const hexToDesc = new Map();
+			if (visionModel && resolvedVisionBase && visionKey) {
+				const { altTexts } = await describeDownloadedImages(captured, { visionModel, resolvedVisionBase, visionKey });
+				captured.forEach((c, i) => { if (altTexts[i + 1]) hexToDesc.set(c.hex, altTexts[i + 1]); });
+			}
+			// ③ AI 语义分类（带缓存）
+			const contexts = buildImageContexts(imageMsgs);
+			const cacheKey = createHash("sha1").update(String(body) + "|" + captured.map((c) => c.hex).join(",")).digest("hex").slice(0, 16);
+			const cls = contexts.length > 0
+				? await cachedClassify(contexts, hexToDesc, { title, cfg, cacheKey })
+				: null;
+			if (cls) {
+				// ④ 程序确定性执行
+				const lineageMap = new Map((cls.images || []).map((i) => [i.imageId, i.lineageId]));
+				const repMap = computeReplacementMap(contexts.map((c) => ({
+					imageId: c.imageId,
+					msgOrder: c.msgOrder,
+					lineageId: lineageMap.get(c.imageId) || `lineage-${c.imageId}`
+				})));
+				const inputs = contexts.map((ctx) => ({
+					imageId: ctx.imageId,
+					isReference: false,
+					relations: (cls.feedbacks || [])
+						.filter((f) => f.imageId === ctx.imageId)
+						.map((f) => ({ relation: f.relation, evidence: f.evidence, confidence: f.confidence })),
+					feedbackTexts: ctx.feedbackEvents.map((e) => e.userText),
+					replacementImageIds: repMap.get(ctx.imageId) || []
+				}));
+				const verdicts = applyKeepDropRules(inputs);
+				const idToHex = new Map(contexts.map((c) => [c.imageId, c.hex]));
+				const keepHex = new Set(verdicts.filter((v) => v.keep).map((v) => idToHex.get(v.imageId)).filter(Boolean));
+				images = captured.filter((c) => keepHex.has(c.hex)).map((c) => c.dataUrl);
+				const dropCount = captured.length - images.length;
+				imageSummary = `AI 按对话反馈判断：保留 ${images.length} 张、排除 ${dropCount} 张（草稿/参考图）`;
 				acceptedNone = images.length === 0;
 			} else {
-				// 兜底：全部保留（宁可多留，不可误删）
-				imageSummary = `模型判断不可用，保守保留全部 ${captured.length} 张`;
+				// 分类不可用（无模型配置/调用失败/输出无法解析）→ 保守全保留（宁可多留）
+				imageSummary = `图片分类不可用，保守保留全部 ${captured.length} 张`;
 				images = captured.map((c) => c.dataUrl);
 			}
 		}
@@ -2053,7 +2091,7 @@ async function fetchChatGptShare(url) {
 function pickAcceptedImageHexes(imageMsgs) {
 	// 只匹配「明确否定/明确重做」语义，避免把“换背景/换口味/延伸/更可爱”这类
 	// 正向迭代请求误判成否定。单字“换/改/调/再/多/少”一律不作为否定依据。
-	// 注意：这只是 LLM 判断失败时的兜底；主路径见 judgeAcceptedImages。
+	// 注意：仅在 AI 语义分类不可用时作保守兜底（只处理强否定）。
 	const rejectRe = /重画|重做|重给|重新调|重新生成|重新按指令|重来|再来一(版|张|次)|不行|还是不行|不太行|不对|不太对|感觉不对|不好|不太好|不好看|难看|不满意|不喜欢|有问题|画错了|画错|三个手|三只手|去掉|删掉|换掉|不要这个|不要这(种|版)|不要背景|这版(不行|不好|废了)|again|try again|not (this|that|one)|remove|drop (it|this)|looks? wrong|no good|ugly/i;
 	const accepted = new Set();
 	const thread = []; // 连续 AI 生成图划分一轮
@@ -2104,17 +2142,10 @@ const SB2B_JUDGE_BASES = {
 	zhipu: "https://open.bigmodel.cn/api/paas/v4"
 };
 
-/**
- * 判断哪些 AI 生成图是「用户最终采纳」的：**视觉优先**——把每张图的缩略图连同
- * 它的对话上下文（用户此前要求/反馈、生成后助手说明、用户随后反馈）一起给视觉
- * 模型，让它「看图 + 理解语义」判断（比纯文字可靠得多）。未配置视觉模型时回退
- * 到纯文本判断；两者都不可用时返回 null，调用方回退保守策略。
- * @param imageMsgs - { role, text, hexes }[]（已过滤后的消息列表）
- * @param downloaded - 抓取到的图片 [{ dataUrl, hex }]（判断后按此顺序出明细）
- * @returns { acceptedHexes:Set, summary:string, details:[{hex,verdict,feedback,ctx}] }
- *   或 null（无法判断）。
- */
-async function judgeAcceptedImages(imageMsgs, downloaded, { title, cfg, visionModel, resolvedVisionBase, visionKey, callChat }) {
+//#region AI 语义分类层（AI 只分类，去留由 lib/judge.js 确定性执行）
+
+/** 主模型调用器（温度 0，保证分类尽量稳定）；配置不完整时返回 null。 */
+function mainModelChat(cfg) {
 	const provider = String((cfg && cfg.provider) || "ark");
 	const apiKey = String((cfg && cfg.apiKey) || "").trim();
 	const model = String((cfg && cfg.model) || "").trim();
@@ -2122,165 +2153,166 @@ async function judgeAcceptedImages(imageMsgs, downloaded, { title, cfg, visionMo
 		? String((cfg && cfg.baseCustom) || "").trim()
 		: (SB2B_JUDGE_BASES[provider] || SB2B_JUDGE_BASES.ark);
 	if (!apiKey || !model || !base) return null;
-	const chat = callChat || ((msgs) => forwardChatCompletion({ base, apiKey, model, messages: msgs }));
+	return (messages, extra) => forwardChatCompletion({ base, apiKey, model, messages, temperature: 0, ...(extra || {}) });
+}
 
-	// ---- 上下文构建：每个 hex 一张图 ----
-	const items = [];
-	let prevAssistSeen = ""; // 连续多张图常共用同一条助手说明（噪音），只保留第一次出现
+/** 宽松解析 LLM 输出中的 JSON 对象（容忍 ```json 包裹 / 前后杂文字）。 */
+function parseJsonLoose(raw) {
+	const s = String(raw || "").trim();
+	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+	const body = fence ? fence[1] : s;
+	// 从每个 { 依次尝试：括号匹配后 JSON.parse，返回第一个成功对象
+	// （模型可能先输出思考文字，真正的 JSON 在后面）
+	for (let start = 0; start < body.length; start++) {
+		if (body[start] !== "{") continue;
+		let depth = 0, inStr = false, esc = false, end = -1;
+		for (let i = start; i < body.length; i++) {
+			const ch = body[i];
+			if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+			if (ch === '"') inStr = true;
+			else if (ch === "{") depth++;
+			else if (ch === "}") { depth--; if (depth === 0) { end = i + 1; break; } }
+		}
+		if (end < 0) break;
+		try {
+			const parsed = JSON.parse(body.slice(start, end));
+			if (parsed && typeof parsed === "object") return parsed;
+		} catch { /* try next */ }
+	}
+	return null;
+}
+
+/**
+ * 从解析后的消息流构建「图片上下文」（AI 分类输入）。
+ * 每张 AI 生成图：prevUserText + assistText + feedbackEvents[]（按时间顺序多条）。
+ * 用户上传的参考图（role=user 带图）不在此列。
+ * @returns Array<{ imageId, hex, msgOrder, prevUserText, assistText, feedbackEvents:[{userText,userIdx}] }>
+ */
+function buildImageContexts(imageMsgs, maxFeedbackEvents = 5) {
+	const contexts = [];
+	let order = 0;
 	for (let i = 0; i < imageMsgs.length; i++) {
 		const m = imageMsgs[i];
 		if (!Array.isArray(m.hexes) || !m.hexes.length) continue;
-		if (m.role === "user") continue; // 用户上传的参考图不算 AI 生成结果
+		if (m.role === "user") continue;
+		order++;
 		let prevUser = "";
 		for (let j = i - 1; j >= 0; j--) {
 			if (imageMsgs[j].role === "user" && String(imageMsgs[j].text || "").trim()) { prevUser = String(imageMsgs[j].text).trim(); break; }
 		}
-		let nextUser = "";
-		let nextAssist = "";
+		let assist = "";
 		for (let j = i + 1; j < imageMsgs.length; j++) {
-			if (imageMsgs[j].role === "user" && !nextUser) nextUser = String(imageMsgs[j].text || "").trim();
-			else if (imageMsgs[j].role === "assistant" && !nextAssist && String(imageMsgs[j].text || "").trim()) nextAssist = String(imageMsgs[j].text).trim();
-			if (nextUser && nextAssist) break;
+			if (imageMsgs[j].role === "assistant" && String(imageMsgs[j].text || "").trim()) { assist = String(imageMsgs[j].text).trim(); break; }
 		}
-		const ctxParts = [];
-		if (prevUser) ctxParts.push(`用户此前要求/反馈：${prevUser.slice(0, 120)}`);
-		if (m.text) ctxParts.push(`图所在消息：${String(m.text).slice(0, 120)}`);
-		if (nextAssist && nextAssist !== prevAssistSeen) ctxParts.push(`生成后助手说明：${nextAssist.slice(0, 120)}`);
-		prevAssistSeen = nextAssist || prevAssistSeen;
-		ctxParts.push(nextUser ? `用户随后反馈：${nextUser.slice(0, 200)}` : "用户随后无反馈");
-		const ctx = ctxParts.join("\n  · ");
-		for (const hex of m.hexes) items.push({ hex, ctx, feedback: nextUser });
-	}
-	if (items.length === 0 && !(Array.isArray(downloaded) && downloaded.length)) return null;
-	const hexItem = new Map(items.map((it) => [it.hex, it]));
-
-	const RULES = [
-		"判断规则（用户拍板的四条，必须严格遵守）：",
-		"1. **明确认可、继续引用、或基于它扩展**的图片（如「这个好」「就用这个」「根据这个延伸其他口味」「再做一个草莓味的」）→ 保留",
-		"2. **明确否定、要求重做，并且后面出现了替代版本** → 排除旧图",
-		"3. **同一设计的连续修改版本**（换背景/改颜色/重做…）：只保留**最终版本**；但用户**明确认可过**的中间基础版本也保留",
-		"4. **无法确定的图片 → 默认保留**，避免误删（宁可多留，不可误删）",
-		"",
-		"执行提示：",
-		"- 「再做一个/延伸」是**保留当前图**（在此基础上做新的）；「把这张改成/重做这张」才是**否定当前图**",
-		"- 「需要和（上面的/这个）设计保持风格一致 / 风格统一」= 当前图风格不符合要求、要求修正 → 排除",
-		"- 用户上传的参考图（无生成上下文）→ 不采纳",
-		"- 只依据给出的信息判断，不要臆测"
-	].join("\n");
-
-	// ---- 判断方式 A（推荐）：两段式——豆包看图写描述，主模型按四条规则判断 ----
-	const hasVision = !!(visionModel && resolvedVisionBase && visionKey && Array.isArray(downloaded) && downloaded.length);
-	if (hasVision) {
-		// 1) 视觉模型只看图，逐张写内容描述（不判断）
-		const { altTexts } = await describeDownloadedImages(downloaded, { visionModel, resolvedVisionBase, visionKey });
-		// 2) 主模型（擅长规则遵循）拿「图片描述 + 对话上下文」按四条规则判断
-		const BATCH = 12;
-		const verdicts = []; // 与 downloaded 一一对应
-		for (let start = 0; start < downloaded.length; start += BATCH) {
-			const chunk = downloaded.slice(start, start + BATCH);
-			const from = start + 1;
-			const to = start + chunk.length;
-			const ctxLines = chunk.map((img, i) => {
-				const n = from + i;
-				const it = hexItem.get(img.hex);
-				const desc = altTexts[n] ? `图片内容：${altTexts[n]}` : "图片内容：（无法识别）";
-				const ctx = it ? it.ctx : "（用户上传的参考图，无生成上下文）";
-				return `图${n}：\n  · ${desc}\n  · ${ctx}`;
-			});
-			const prompt = [
-				`对话标题：${title || ""}`,
-				`以下是 ${chunk.length} 张图片（对话附图第 ${from}~${to} 张）。每张给出它的**图片内容描述**与**对话上下文**。请结合两者，按规则判断每张是否为「用户最终认可、应保留的版本」：`,
-				"",
-				ctxLines.join("\n"),
-				"",
-				RULES,
-				"",
-				"只输出两行：",
-				`采纳：<编号${from}~${to}中的列表，逗号分隔；无则写 无>`,
-				`不采纳：<编号${from}~${to}中的列表，逗号分隔；无则写 无>`
-			].join("\n");
-			let chunkOut = "";
-			try {
-				chunkOut = String(await chat([
-					{ role: "system", content: "你是图片取舍助手。依据图片内容描述与对话上下文，按给定规则判断每张图采纳/不采纳，只输出两行编号列表。" },
-					{ role: "user", content: prompt }
-				]) || "").trim();
-			} catch {
-				/* 该批失败：未列出的按采纳（保守，宁可多留） */
-			}
-			const parsed = parseVerdictList(chunkOut, from, to);
-			for (let i = 0; i < chunk.length; i++) {
-				const n = from + i;
-				const it = hexItem.get(chunk[i].hex);
-				if (it) {
-					if (parsed && parsed.rej && parsed.rej.includes(n)) verdicts.push("reject");
-					else verdicts.push("accept"); // 明确采纳 / 未列出 / 解析失败 → 保守保留
-				} else {
-					verdicts.push("reject"); // 用户上传参考图：默认排除
-				}
+		const events = [];
+		for (let j = i + 1; j < imageMsgs.length && events.length < maxFeedbackEvents; j++) {
+			if (imageMsgs[j].role === "user" && String(imageMsgs[j].text || "").trim()) {
+				events.push({ userText: String(imageMsgs[j].text).trim(), userIdx: j });
 			}
 		}
-		const acceptedHexes = new Set();
-		const details = [];
-		for (let i = 0; i < downloaded.length; i++) {
-			const v = i < verdicts.length ? verdicts[i] : "accept";
-			const it = hexItem.get(downloaded[i].hex);
-			if (v === "accept" && it) acceptedHexes.add(downloaded[i].hex);
-			details.push({ hex: downloaded[i].hex, verdict: v, feedback: (it && it.feedback) || "", ctx: (it && it.ctx) || "" });
+		contexts.push({
+			imageId: `img-${order}`,
+			hex: m.hexes[0],
+			msgOrder: order,
+			prevUserText: prevUser,
+			assistText: assist,
+			feedbackEvents: events
+		});
+	}
+	return contexts;
+}
+
+/**
+ * AI 语义分类：对每张图分配 lineageId（同一设计修改链），对每条用户反馈分类
+ * （approve/extend/modify/negate/uncertain）+ 原文证据 + 置信度。不输出去留。
+ * @returns { images:[{imageId,lineageId}], feedbacks:[{imageId,feedbackIdx,relation,evidence,confidence}] } | null
+ */
+async function classifyImages(contexts, hexToDesc, { title, cfg }) {
+	const chat = mainModelChat(cfg);
+	if (!chat || !Array.isArray(contexts) || contexts.length === 0) return null;
+	const BATCH = 10;
+	const CHAT_MAX_TOKENS = 16384; // 分类模型常先输出思考过程，需要足够配额再输出 JSON
+	const imagesOut = [];
+	const feedbacksOut = [];
+	for (let start = 0; start < contexts.length; start += BATCH) {
+		const chunk = contexts.slice(start, start + BATCH);
+		const blocks = chunk.map((ctx) => {
+			const desc = hexToDesc.get(ctx.hex) ? hexToDesc.get(ctx.hex) : "（无法识别）";
+			const evs = ctx.feedbackEvents.length
+				? ctx.feedbackEvents.map((e) => `    [反馈#${e.userIdx}] ${e.userText.slice(0, 160)}`).join("\n")
+				: "    （无后续反馈）";
+			return [
+				`图 ${ctx.imageId}：`,
+				`  内容描述：${desc}`,
+				ctx.prevUserText ? `  用户此前：${ctx.prevUserText.slice(0, 120)}` : "",
+				ctx.assistText ? `  助手说明：${ctx.assistText.slice(0, 120)}` : "",
+				`  用户反馈：`,
+				evs
+			].filter(Boolean).join("\n");
+		});
+		const prompt = [
+			`对话标题：${title || ""}`,
+			`以下是这段对话中出现的 ${chunk.length} 张 AI 生成图（按出现顺序编号）。每张图给出：内容描述、生成背景、助手说明、其后的用户反馈（[反馈#N] N 为消息序号）。`,
+			"",
+			blocks.join("\n\n"),
+			"",
+			"请完成两件事：",
+			"1. 【修改链】为每张图分配 lineageId（短字符串）：同一设计的连续修改版本（换背景/改颜色/重做这张）归同一 lineage；新口味、延伸设计、其他任务归不同 lineage。",
+			"2. 【反馈分类】对每条用户反馈，判断它相对「它前面最近的那张图」的关系，取值：",
+			"   approve=明确认可当前图（这个好/就用这个/喜欢）；",
+			"   extend=基于当前图延伸/做新变体（根据这个延伸/再做一个X味的）；",
+			"   modify=在认可基础上做局部调整（换背景/改颜色/更可爱/只要产品…，但没说不行）；",
+			"   negate=明确否定或要求重做这张图（不要这张/这版不行/重画这张/需要和上面的设计保持风格一致/风格不一致要修正）；",
+			"   uncertain=无法确定（模棱两可一律 uncertain，宁可 uncertain）；**与图片本身无关的反馈**（下载/操作/格式等技术问题）也归 uncertain",
+			"   evidence 必须是用户原话的连续片段（逐字引用，不要概括）；confidence 0~1。",
+			"",
+			"判定示例（务必遵守）：",
+			"· 用户说「需要和上面的设计保持风格一致」或「需要和这个风格保持一致，主要是口味元素颜色的调整」→ 都是 negate（要求重做/修正当前图，即使语气温和）",
+			"· 用户说「可以，再根据这个延伸其他口味」/「做葡萄味的」/「再做一个草莓味的」→ extend（基于当前图延伸，当前图保留）",
+			"· 用户说「我只要产品本身的图…包装更可爱一点」→ modify（在认可基础上调整，没说不行）",
+			"· 用户说「为什么无法下载」等与图片内容无关的技术反馈 → uncertain（保留）",
+			"",
+			"**禁止输出任何思考过程/解释/推理，直接输出 JSON 结果**，不要任何其他文字：",
+			'{ "images": [{"imageId":"img-1","lineageId":"A"}], "feedbacks": [{"imageId":"img-1","feedbackIdx":5,"relation":"extend","evidence":"...","confidence":0.9}] }'
+		].join("\n");
+		let raw = "";
+		try {
+			raw = String(await chat([
+				{ role: "system", content: "你是图片语义分析助手。**直接输出 JSON 结果，禁止任何思考过程、解释或多余文字**，严格按用户要求的格式。" },
+				{ role: "user", content: prompt }
+			], { max_tokens: CHAT_MAX_TOKENS }) || "").trim();
+		} catch {
+			return null;
 		}
-		const accN = details.filter((d) => d.verdict === "accept").length;
-		const rejN = details.length - accN;
-		const summary = `看图+按用户反馈：保留 ${accN} 张、排除 ${rejN} 张（草稿/参考图）`;
-		return { acceptedHexes, summary, details };
+		const parsed = parseJsonLoose(raw);
+		if (!parsed || !Array.isArray(parsed.images) || !Array.isArray(parsed.feedbacks)) return null;
+		imagesOut.push(...parsed.images);
+		feedbacksOut.push(...parsed.feedbacks);
 	}
-
-	// ---- 判断方式 B：纯文本主模型（未配置视觉模型时）----
-	if (items.length === 0) return null;
-	const prompt = [
-		`对话标题：${title || ""}`,
-		`以下是这段对话中出现的 ${items.length} 张 AI 生成图（按出现顺序编号）。每张附上它周围的对话片段（用户此前的要求/反馈、生成后助手的说明、用户随后的反馈）。请**理解对话语义**，判断每张图是否属于「用户最终认可、应保留的版本」：`,
-		"",
-		items.map((it, idx) => `图${idx + 1}：\n  · ${it.ctx}`).join("\n"),
-		"",
-		RULES,
-		"",
-		"只输出两行：",
-		"采纳：<编号列表，逗号分隔；无则写 无>",
-		"不采纳：<编号列表，逗号分隔；无则写 无>"
-	].join("\n");
-	let out;
-	try {
-		out = String(await chat([
-			{ role: "system", content: "你是图片取舍助手。只按指定格式输出采纳/不采纳的编号列表，不要多余内容。" },
-			{ role: "user", content: prompt }
-		]) || "").trim();
-	} catch {
-		return null;
-	}
-	const parsed = parseVerdictList(out, 1, items.length);
-	if (!parsed || (parsed.acc === null && parsed.rej === null)) return null;
-	const accSet = parsed.acc !== null ? new Set(parsed.acc) : new Set(items.map((_, i) => i + 1).filter((n) => !parsed.rej.includes(n)));
-	const acceptedHexes = new Set(items.filter((_, i) => accSet.has(i + 1)).map((it) => it.hex));
-	const accList = items.map((_, i) => i + 1).filter((n) => accSet.has(n));
-	const rejList = items.map((_, i) => i + 1).filter((n) => !accSet.has(n));
-	const details = items.map((it, idx) => ({ hex: it.hex, verdict: accSet.has(idx + 1) ? "accept" : "reject", feedback: it.feedback, ctx: it.ctx }));
-	const summary = `按用户反馈：保留 ${accList.length} 张（对话顺序：图${accList.join(",") || "无"}），排除 ${rejList.length} 张（图${rejList.join(",") || "无"}）`;
-	return { acceptedHexes, summary, details };
+	return { images: imagesOut, feedbacks: feedbacksOut };
 }
 
-/** 解析「采纳：… / 不采纳：…」两行，编号限定在 [from, to]；缺行返回 null。 */
-function parseVerdictList(text, from, to) {
-	const s = String(text || "");
-	const accM = /(?<!不)采纳\s*[：:]\s*([^\n]*)/.exec(s);
-	const rejM = /不采纳\s*[：:]\s*([^\n]*)/.exec(s);
-	const parse = (m) => {
-		if (!m) return null;
-		const t = m[1].trim();
-		if (/^无$/.test(t)) return [];
-		return t.split(/[,，、\s]+/).map((x) => Number(x.trim())).filter((n) => Number.isFinite(n) && n >= from && n <= to);
-	};
-	return { acc: parse(accM), rej: parse(rejM) };
+/** 分类结果按「对话内容哈希」缓存到本机（重复导入同一链接不漂移；不进仓库）。 */
+async function cachedClassify(contexts, hexToDesc, { title, cfg, cacheKey }) {
+	const cacheDir = join(dshHome(), "plugins", "second-brain", "judge-cache");
+	if (cacheKey) {
+		try {
+			const raw = await readFile(join(cacheDir, cacheKey + ".json"), "utf8");
+			const cached = JSON.parse(raw);
+			if (cached && Array.isArray(cached.images) && Array.isArray(cached.feedbacks)) return cached;
+		} catch { /* miss */ }
+	}
+	const result = await classifyImages(contexts, hexToDesc, { title, cfg });
+	if (result && cacheKey) {
+		try {
+			await mkdir(cacheDir, { recursive: true });
+			await writeFile(join(cacheDir, cacheKey + ".json"), JSON.stringify(result), "utf8");
+		} catch { /* 缓存失败不影响流程 */ }
+	}
+	return result;
 }
+
+//#endregion
 
 /** 探测并加载本机可用的 puppeteer-core（不同安装目录随机替换，需动态解析）。 */
 async function loadPuppeteerCore() {
