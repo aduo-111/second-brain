@@ -1282,7 +1282,7 @@ async function fetchDoubaoShare(shareId) {
  * policies never block the request.
  */
 async function forwardChatCompletion(payload) {
-	const { base, apiKey, model, messages, temperature, max_tokens } = payload;
+	const { base, apiKey, model, messages, temperature, max_tokens, timeoutMs } = payload;
 	if (!base || !apiKey || !model) throw new Error("模型服务配置不完整（base / apiKey / model 缺失）");
 	if (!Array.isArray(messages) || messages.length === 0) throw new Error("没有可发送的消息");
 	const url = String(base).replace(/\/+$/, "") + "/chat/completions";
@@ -1301,7 +1301,7 @@ async function forwardChatCompletion(payload) {
 			"authorization": "Bearer " + apiKey
 		},
 		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(240000)
+		signal: AbortSignal.timeout(timeoutMs ?? 240000)
 	});
 	const json = await response.json().catch(() => null);
 	if (!response.ok || !json) {
@@ -2230,10 +2230,12 @@ function buildImageContexts(imageMsgs, maxFeedbackEvents = 5) {
 async function classifyImages(contexts, hexToDesc, { title, cfg }) {
 	const chat = mainModelChat(cfg);
 	if (!chat || !Array.isArray(contexts) || contexts.length === 0) return null;
-	const BATCH = 10;
+	const BATCH = 8;
 	const CHAT_MAX_TOKENS = 16384; // 分类模型常先输出思考过程，需要足够配额再输出 JSON
+	const CHAT_TIMEOUT = 300000; // 单批最多 5 分钟（模型先思考后输出 JSON，耗时长）
 	const imagesOut = [];
 	const feedbacksOut = [];
+	let anyBatchOk = false;
 	for (let start = 0; start < contexts.length; start += BATCH) {
 		const chunk = contexts.slice(start, start + BATCH);
 		const blocks = chunk.map((ctx) => {
@@ -2280,15 +2282,17 @@ async function classifyImages(contexts, hexToDesc, { title, cfg }) {
 			raw = String(await chat([
 				{ role: "system", content: "你是图片语义分析助手。**直接输出 JSON 结果，禁止任何思考过程、解释或多余文字**，严格按用户要求的格式。" },
 				{ role: "user", content: prompt }
-			], { max_tokens: CHAT_MAX_TOKENS }) || "").trim();
+			], { max_tokens: CHAT_MAX_TOKENS, timeoutMs: CHAT_TIMEOUT }) || "").trim();
 		} catch {
-			return null;
+			continue; // 该批失败：这批图的反馈视为缺失 → uncertain → 保留，不放弃整体
 		}
 		const parsed = parseJsonLoose(raw);
-		if (!parsed || !Array.isArray(parsed.images) || !Array.isArray(parsed.feedbacks)) return null;
+		if (!parsed || !Array.isArray(parsed.images) || !Array.isArray(parsed.feedbacks)) continue;
+		anyBatchOk = true;
 		imagesOut.push(...parsed.images);
 		feedbacksOut.push(...parsed.feedbacks);
 	}
+	if (!anyBatchOk) return null;
 	return { images: imagesOut, feedbacks: feedbacksOut };
 }
 
