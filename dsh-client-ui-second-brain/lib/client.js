@@ -612,10 +612,10 @@ window.__ModuleLoader__.load({
 					const judgeNote = result.imageSummary ? `（${result.imageSummary}）` : "";
 					const imgNote = imgCount
 						? (imgCap === 0
-							? `，已抓取 ${imgCount} 张图片${judgeNote}，但「图片保存上限」设为 0（不保存图片），仅总结文字`
-							: `，已抓取 ${imgCount} 张图片${judgeNote}；按「图片保存上限 ${imgCap}」，归档时将嵌入前 ${Math.min(imgCount, imgCap)} 张（多图对话如需全部保留，请先在设置里调高上限）`)
+							? `，AI 已判断保留 ${imgCount} 张图片${judgeNote}，但「图片保存上限」设为 0（不保存图片），仅总结文字`
+							: `，AI 已判断保留 ${imgCount} 张图片${judgeNote}；按「图片保存上限 ${imgCap}」，归档时将全部嵌入`)
 						: (result.acceptedNone
-							? `，该对话含 ${result.imageCount} 张图片，但按用户反馈全部判定为草稿/未被采纳${judgeNote}，未保存图片，仅总结文字`
+							? `，该对话含 ${result.imageCount} 张图片，但 AI 判断全部为草稿/参考图${judgeNote}，未保存图片，仅总结文字`
 							: (result.imageCount ? `，该对话含 ${result.imageCount} 张图片，但本机抓取图片失败（需本机装有 Edge/Chrome 且能访问 ChatGPT 分享页），本次仅总结文字` : ""));
 					setStatusOk(`已获取《${result.title}》，共 ${result.messageCount} 条消息（${t.length} 字符）${imgNote}。可编辑后总结。`);
 				} catch (error) {
