@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 280px; margin: 0; padding: 14px 16px; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 13px; color: #1f2329; }
+    h1 { font-size: 14px; margin: 0 0 4px; }
+    .sub { color: #9aa3ad; margin: 0 0 12px; line-height: 1.5; }
+    .status { padding: 8px 10px; border-radius: 8px; line-height: 1.5; margin-bottom: 10px; }
+    .ok { background: rgba(61,154,80,.1); color: #2f7d3e; }
+    .err { background: rgba(214,69,64,.1); color: #c0392b; }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+    a { color: #4e6ef2; text-decoration: none; }
+    ul { margin: 8px 0 0; padding-left: 18px; color: #5c6270; line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <h1>🧠 AI 第二大脑 · 通用提炼</h1>
+  <p class="sub">在任意 AI 网页（豆包 / ChatGPT / Work Buddy / Kimi / 通义…）点「✨」即可把当前对话提炼成笔记，写入你的 Obsidian 库。</p>
+  <div id="status" class="status err">正在检测本机 DeepSeek Harness…</div>
+  <div class="row">
+    <b>使用步骤：</b>
+  </div>
+  <ul>
+    <li>1. 打开本机 DeepSeek Harness（http://127.0.0.1:3080）</li>
+    <li>2. 设置 → AI 第二大脑 → 填 Obsidian 库路径 → 「💾 保存到本机」</li>
+    <li>3. 打开你要提炼的 AI 对话页，点右下角「✨ 提炼本对话」</li>
+  </ul>
+  <div class="row"><a href="http://127.0.0.1:3080" target="_blank">打开 DeepSeek Harness →</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>

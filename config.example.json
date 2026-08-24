@@ -1,0 +1,17 @@
+{
+  "vaultPath": "/Users/你的用户名/Documents/Obsidian库",
+  "folder": "AI 第二大脑",
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "baseCustom": "",
+  "layout": "auto",
+  "detail": "brief",
+  "selfCheck": "true",
+  "tags": "AI对话",
+  "maxImages": "50",
+  "multimodal": "false",
+  "visionProvider": "ark",
+  "visionModel": "",
+  "visionKey": "",
+  "visionBase": ""
+}

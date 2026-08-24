@@ -1,0 +1,20 @@
+# 依赖与缓存
+node_modules/
+.pnpm-store/
+
+# 个人配置文件（含 API Key，严禁提交）
+config.json
+config.local.json
+*.local.json
+.env
+
+# 系统与编辑器杂项
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+
+# 个人数据（Obsidian 库 / 会话等，绝不入库）
+*.md.bak

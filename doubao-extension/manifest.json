@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "AI 第二大脑 · 通用提炼",
+  "version": "0.2.0",
+  "description": "在任何 AI 网页（豆包 / ChatGPT / Work Buddy / Kimi / 通义 / 文心…）一键把当前对话提炼成 Markdown 笔记，写入 Obsidian（通过本机 DeepSeek Harness 的 /api/second-brain/distill）。",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:3080/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "AI 第二大脑 · 通用提炼",
+    "default_popup": "popup.html"
+  }
+}
